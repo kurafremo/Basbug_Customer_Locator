@@ -1,0 +1,56 @@
+name: basbug_customer_locator
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8  
+  flutter_map: ^6.0.1      # Ücretsiz harita altyapımız (OpenStreetMap için)
+  latlong2: ^0.9.0         # Enlem ve boylam hesaplamaları/modellemeleri için
+  sqflite: ^2.3.0          # SQLite veritabanını okumak için
+  path: ^1.8.3             # Klasör yollarını cihaz bağımsız bulmak için
+  flutter_riverpod: ^3.4.2
+  geolocator: ^14.0.3
+  dio: ^5.11.0
+  dropdown_search: ^7.0.0
+  flutter_secure_storage: ^11.0.0
+  connectivity_plus: ^7.3.1
+  logger: ^2.7.0
+  flutter_dotenv: ^6.0.1
+  package_info_plus: ^10.2.1
+  url_launcher: ^6.3.2
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/db/CustomerGeo.db # Veritabanımızı uygulamaya gömüyoruz
+    - assets/images/
+    - .env
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+  # --- YENİ EKLENEN PAKETLER ---
+  flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.3.1
+  mocktail: ^1.0.5
+
+# --- KURUMSAL İKON AYARLARI ---
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/icon.png"
+
+# --- AÇILIŞ EKRANI (SPLASH SCREEN) AYARLARI ---
+flutter_native_splash:
+  color: "#ffffff" # Açılış ekranı arka plan rengi (Beyaz)
+  image: "assets/images/icon.png" # Ekranda belirecek logo
+  android_12:
+    color: "#ffffff"
+    image: "assets/images/logo1.png"
