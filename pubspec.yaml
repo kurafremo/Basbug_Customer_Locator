@@ -24,6 +24,9 @@ dependencies:
   flutter_dotenv: ^6.0.1
   package_info_plus: ^10.2.1
   url_launcher: ^6.3.2
+  flutter_map_marker_cluster: ^1.3.6
+  in_app_update: ^5.0.0
+  cached_network_image: ^3.4.1
 
 flutter:
   uses-material-design: true
@@ -45,12 +48,17 @@ dev_dependencies:
 flutter_icons:
   android: true
   ios: true
-  image_path: "assets/images/icon.png"
+ # image_path: "assets/images/icon.png"
+  adaptive_icon_background: "#FFFFFF" 
+  #adaptive_icon_foreground: "assets/images/icon.png"
 
 # --- AÇILIŞ EKRANI (SPLASH SCREEN) AYARLARI ---
 flutter_native_splash:
-  color: "#ffffff" # Açılış ekranı arka plan rengi (Beyaz)
-  image: "assets/images/icon.png" # Ekranda belirecek logo
+  color: "#FFFFFF" # Açılış ekranı arka plan rengi (Beyaz)
+  android: true
+  ios: true
+  fullscreen: true
   android_12:
-    color: "#ffffff"
-    image: "assets/images/logo1.png"
+    image: "assets/images/transparent.png"
+    #image: "assets/images/logo.png"
+    color: "#FFFFFF"

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:in_app_update/in_app_update.dart';
 import '../../core/network/api_service.dart';
 import '../../providers/auth_provider.dart';
 import '../auth/login_screen.dart';
@@ -26,7 +27,31 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   }
 
   Future<void> _startAppRouting() async {
-    // 1. ADIM: VERSİYON KONTROLÜ
+    // --- 1. ADIM: GOOGLE PLAY IN-APP UPDATE (RESMİ UYGULAMA İÇİ GÜNCELLEME) ---
+    try {
+      AppUpdateInfo updateInfo = await InAppUpdate.checkForUpdate();
+      
+      // Mağazada yeni bir sürüm var mı?
+      if (updateInfo.updateAvailability == UpdateAvailability.updateAvailable) {
+        
+        // Zorunlu güncelleme ise (Immediate)
+        if (updateInfo.immediateUpdateAllowed) {
+          await InAppUpdate.performImmediateUpdate();
+          return; // Güncelleme bitene kadar uygulamaya girişi kilitle!
+        } 
+        // Esnek güncelleme ise (Arka planda indir, sonra kur)
+        else if (updateInfo.flexibleUpdateAllowed) {
+          await InAppUpdate.startFlexibleUpdate();
+          await InAppUpdate.completeFlexibleUpdate();
+        }
+      }
+    } catch (e) {
+      // Uygulama henüz Play Store'da değilse veya cihazda Play Store yoksa hata fırlatır.
+      // Sistemi kilitlememek için bu hatayı sadece logluyor ve 2. adıma (Yedek) geçiyoruz.
+      debugPrint("Play Store In-App Update atlandı: $e");
+    }
+
+    // --- 2. ADIM: KENDİ ÖZEL API VERSİYON KONTROLÜMÜZ (YEDEK / FAIL-SAFE) ---
     try {
       PackageInfo packageInfo = await PackageInfo.fromPlatform();
       String currentVersion = packageInfo.version;
@@ -37,13 +62,14 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
 
       if (versionData["isUpdateRequired"] == true) {
         _showForceUpdateDialog(versionData["updateUrl"], versionData["latestVersion"]);
-        return; // Güncelleme lazımsa burada dur, içeri alma!
+        return; // Özel uyarımızı göster ve içeri alma
       }
     } catch (e) {
-      // Sürüm kontrolü başarısız olursa çalışmaya devam et (Fail-Safe)
+      // Sunucuya ulaşılamazsa saha operasyonu durmasın diye devam ediyoruz.
+      debugPrint("Özel API versiyon kontrolü başarısız: $e");
     }
 
-    // 2. ADIM: TOKEN (BENİ HATIRLA) KONTROLÜ
+    // --- 3. ADIM: TOKEN (BENİ HATIRLA) KONTROLÜ VE YÖNLENDİRME ---
     bool isLoggedIn = await ref.read(authProvider.notifier).checkAutoLogin();
     
     if (!mounted) return;
@@ -101,14 +127,13 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Görsel açılış ekranımız (Logomuz ortada bekliyor)
     return Scaffold(
       backgroundColor: Colors.white,
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Image.asset('assets/images/icon.png', width: 120, height: 120),
+            Image.asset('assets/images/logo.png', width: 120, height: 120),
             const SizedBox(height: 30),
             const CircularProgressIndicator(color: Colors.blue),
             const SizedBox(height: 10),

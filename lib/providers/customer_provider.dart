@@ -6,6 +6,7 @@ import '../core/local_db/database_helper.dart';
 import '../core/network/api_service.dart';
 import '../models/customer_model.dart';
 import '../core/utils/app_logger.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class CustomerState {
   final List<CustomerModel> customers;
@@ -37,81 +38,140 @@ class CustomerNotifier extends Notifier<CustomerState> {
   @override
   CustomerState build() {
     checkInternetAndSync(); 
+    
+    // SENİOR DOKUNUŞU: Arka planda sürekli internet bağlantısını dinle.
+    // Bağlantı geri geldiği an kimseye sormadan kuyruktaki verileri Holding'e postala!
+    Connectivity().onConnectivityChanged.listen((List<ConnectivityResult> results) {
+      bool hasInternet = results.contains(ConnectivityResult.mobile) || results.contains(ConnectivityResult.wifi);
+      if (hasInternet) {
+        checkInternetAndSync(); 
+      } else {
+        state = state.copyWith(isOffline: true);
+      }
+    });
+
     return CustomerState();
   }
+  
+  // --- GÜNCELLENEN YENİ METOD: HARİTA AÇILDIĞINDA ÇAĞRILACAK ---
+  Future<void> fetchMyCustomers() async {
+    state = state.copyWith(isLoading: true, errorMessage: null);
 
-  // 1. ARAMA İŞLEMİ (Offline-First: Önce Cihaz, Sonra Bulut)
-  Future<void> searchCustomers(String customerId) async {
+    // İleride bu değer authProvider'dan (giriş yapan kişinin token'ından) gelecek.
+    try {
+      const storage = FlutterSecureStorage();
+      // Kasadan giriş yapan plasiyerin kodunu oku (Yoksa varsayılan olarak '*' al)
+      String mySalDeptCode = await storage.read(key: 'saldept_code') ?? "*"; 
+      
+      AppLogger.info("Harita Yükleniyor... Plasiyer Kodu: $mySalDeptCode");
+
+      final myCustomers = await _dbHelper.getCustomersBySalDept(mySalDeptCode);
+      
+      state = state.copyWith(isLoading: false, customers: myCustomers);
+    } catch (e) {
+      state = state.copyWith(isLoading: false, errorMessage: "Plasiyer müşterileri yüklenemedi.");
+    }
+  }
+
+ // 1. ARAMA İŞLEMİ (SENİOR DOKUNUŞU: Ana Listeyi Asla Bozmaz!)
+  // DİKKAT: Artık void değil, Future<CustomerModel?> döndürüyor!
+  Future<CustomerModel?> searchCustomers(String customerId) async {
     state = state.copyWith(isLoading: true, errorMessage: null);
 
     try {
-      // 1. ADIM: Cihazın yerel SQLite veritabanına bak
+      // 1. ADIM: Zaten indirdiğimiz ana listede var mı?
+      final existingCustomers = state.customers.where((c) => c.customerId.toUpperCase() == customerId.toUpperCase().trim()).toList();
+
+      if (existingCustomers.isNotEmpty) {
+        state = state.copyWith(isLoading: false);
+        return existingCustomers.first; // Haritayı kaydırmak için ilkini döndür
+      }
+
+      // 2. ADIM: Listede yoksa Local DB'de ara
       final localCustomers = await _dbHelper.getCustomersById(customerId);
 
       if (localCustomers.isNotEmpty) {
-        state = state.copyWith(isLoading: false, customers: localCustomers);
-        return; 
+        // KRİTİK NOKTA: Listeyi ezmiyoruz! Bulunan yeni müşteriyi mevcut listenin ÜZERİNE EKLİYORUZ.
+        state = state.copyWith(isLoading: false, customers: [...state.customers, ...localCustomers]);
+        return localCustomers.first;
       }
 
-      // 2. ADIM: Cihazda yoksa Holding'in API sunucusuna git
+      // 3. ADIM: Hiçbir yerde yoksa API'ye sor
       final apiCustomers = await _apiService.getCustomerLocations(customerId);
       
       if (apiCustomers.isNotEmpty) {
-        state = state.copyWith(isLoading: false, customers: apiCustomers);
+        state = state.copyWith(isLoading: false, customers: [...state.customers, ...apiCustomers]);
+        return apiCustomers.first;
       } else {
-        state = state.copyWith(isLoading: false, errorMessage: "Müşteri sistemde bulunamadı.", customers: []);
+        state = state.copyWith(isLoading: false, errorMessage: "Müşteri sistemde bulunamadı.");
+        return null;
       }
     } catch (e) {
-      state = state.copyWith(isLoading: false, errorMessage: "Arama sırasında bir hata oluştu.", customers: []);
+      state = state.copyWith(isLoading: false, errorMessage: "Arama sırasında bir hata oluştu.");
+      return null;
     }
   }
 
-  // 2. KİRLİ VERİYİ VEYA YENİ MÜŞTERİYİ KAYDETME (Kurumsal Mimari)
-  Future<bool> updateAndSyncLocation(String customerId, double lat, double lng, String address) async {
+  // 2. KAYDETME İŞLEMİ (Sadece İnternet Yokken Telefona Kaydet, Çift Kaydı Önle)
+  Future<bool> updateAndSyncLocation(CustomerModel oldCustomer, double lat, double lng, String address) async {
     state = state.copyWith(isLoading: true);
 
-    // KURAL 1: İNTERNET OLSUN VEYA OLMASIN, ÖNCE CİHAZA (SQLITE) KAYDET/GÜNCELLE
-    // Bu sayede veri asla kaybolmaz ve "Müşteri bulunamadı" hatası yaşanmaz.
-    int localResult = await _dbHelper.updateCustomerLocationLocally(customerId, lat, lng);
+    // 1. ÖNCE İNTERNETİ KONTROL ET
+    var connectivityResult = await (Connectivity().checkConnectivity());
+    bool hasInternet = connectivityResult.contains(ConnectivityResult.mobile) || connectivityResult.contains(ConnectivityResult.wifi);
 
-    if (localResult > 0) {
-      // KURAL 2: Şimdi interneti kontrol et ve buluta göndermeyi dene
-      var connectivityResult = await (Connectivity().checkConnectivity());
-      bool hasInternet = connectivityResult.contains(ConnectivityResult.mobile) || connectivityResult.contains(ConnectivityResult.wifi);
+    bool isOperationSuccessful = false;
 
-      if (hasInternet) {
-        bool apiSuccess = await _apiService.updateCustomerLocation(customerId, lat, lng, address);
-        
-        if (!apiSuccess) {
-          // İnternet var ama API cevap vermedi (Örn: 500 Server Error) -> Veriyi güvene al (Kuyruğa at)
-          AppLogger.error("Sunucu yanıt vermedi! İşlem çevrimdışı kuyruğa alınıyor...");
-          await _dbHelper.insertToSyncQueue(customerId, lat, lng, address);
-        }
+    if (hasInternet) {
+      // DURUM A: İNTERNET VAR -> Yalnızca Sunucuya (Veritabanına) Kaydet.
+      // Yerel telefona (updateCustomerLocationLocally) ASLA kaydetme!
+      bool apiSuccess = await _apiService.updateCustomerLocation(oldCustomer.customerId, lat, lng, address);
+      
+      if (apiSuccess) {
+        isOperationSuccessful = true;
       } else {
-        // İnternet hiç yok -> Doğrudan kuyruğa at
-        AppLogger.error("İNTERNET YOK! İşlem çevrimdışı kuyruğa alınıyor...");
-        state = state.copyWith(isOffline: true);
-        await _dbHelper.insertToSyncQueue(customerId, lat, lng, address); 
+        // Sunucu anlık çöktüyse mecburen kuyruğa al (Fail-Safe)
+        AppLogger.error("Sunucu reddetti! İşlem çevrimdışı kuyruğa alınıyor...");
+        await _dbHelper.insertToSyncQueue(oldCustomer.customerId, lat, lng, address);
+        isOperationSuccessful = true; 
+      }
+    } else {
+      // DURUM B: İNTERNET YOK -> Sadece Telefona (Bekleyenler Kuyruğuna) Kaydet.
+      AppLogger.error("İnternet Yok! Cihaz hafızasında kuyruğa alınıyor...");
+      state = state.copyWith(isOffline: true);
+      await _dbHelper.insertToSyncQueue(oldCustomer.customerId, lat, lng, address); 
+      isOperationSuccessful = true; 
+    }
+
+    // 2. RAM OPTİMİZASYONU (SADECE EKRANI GÜNCELLE)
+    if (isOperationSuccessful) {
+      List<CustomerModel> updatedList = List.from(state.customers);
+      
+      // Çift kaydı engellemek için listede arıyoruz
+      int index = updatedList.indexWhere((c) => c.customerId.toUpperCase() == oldCustomer.customerId.toUpperCase());
+      
+      if (index != -1) {
+        // Zaten listedeyse (Konumu olmayanlardan geldiyse) sadece koordinatları değiştir
+        updatedList[index] = CustomerModel(customerId: oldCustomer.customerId, latitude: lat, longitude: lng);
+      } else {
+        // Yeni eklendiyse listeye sadece BİR KERE dahil et
+        updatedList.add(CustomerModel(customerId: oldCustomer.customerId, latitude: lat, longitude: lng));
       }
 
-      // Haritada yeşil pinin anında görünmesi için arayüzü tetikliyoruz
-      await searchCustomers(customerId); 
-      return true; // Kullanıcı açısından işlem başarılı.
-      
+      state = state.copyWith(isLoading: false, customers: updatedList); 
+      return true; 
     } else {
-      state = state.copyWith(isLoading: false, errorMessage: "Cihaz hafızasına kaydedilemedi.");
+      state = state.copyWith(isLoading: false, errorMessage: "İşlem başarısız oldu.");
       return false;
     }
   }
-
-  // 3. İNTERNET GELDİĞİNDE KUYRUĞU ERİTME İŞLEMİ (Background Sync)
+  // 3. KUYRUK ERİTME İŞLEMİ
   Future<void> checkInternetAndSync() async {
     var connectivityResult = await (Connectivity().checkConnectivity());
     bool hasInternet = connectivityResult.contains(ConnectivityResult.mobile) || connectivityResult.contains(ConnectivityResult.wifi);
 
     if (hasInternet) {
       state = state.copyWith(isOffline: false);
-      
       final pendingTasks = await _dbHelper.getPendingSyncs();
       
       if (pendingTasks.isNotEmpty) {
@@ -119,17 +179,12 @@ class CustomerNotifier extends Notifier<CustomerState> {
         
         for (var task in pendingTasks) {
           bool apiSuccess = await _apiService.updateCustomerLocation(
-            task['customerCode'], 
-            task['latitude'], 
-            task['longitude'], 
-            task['address']
+            task['customerCode'], task['latitude'], task['longitude'], task['address']
           );
-          
           if (apiSuccess) {
             await _dbHelper.removeFromSyncQueue(task['id']);
           }
         }
-        AppLogger.info("Kuyruk başarıyla eritildi ve sunucu ile senkronize olundu!");
       }
     } else {
       state = state.copyWith(isOffline: true);
@@ -137,7 +192,8 @@ class CustomerNotifier extends Notifier<CustomerState> {
   }
 
   void clearSearch() {
-    state = CustomerState();
+    // SENİOR DOKUNUŞU: Bellekteki listeyi (customers) koruyarak sadece hata mesajını temizliyoruz.
+    state = state.copyWith(errorMessage: null);
   }
 }
 

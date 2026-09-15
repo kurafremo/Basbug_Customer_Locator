@@ -5,13 +5,31 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter_map_marker_cluster/flutter_map_marker_cluster.dart'; 
 import '../../providers/customer_provider.dart';
 import '../../models/customer_model.dart';
 import '../../core/network/api_service.dart';
 import '../auth/login_screen.dart';
 import 'dart:async';
+import '../customers/unlocated_customers_screen.dart';
+import '../customers/located_customers_screen.dart';
+import '../../core/network/cached_tile_provider.dart';
 
-bool _isMapCenteredOnUser = false; // Haritanın kullanıcının konumuna bir kez gitmesi için
+bool _isMapCenteredOnUser = false; 
+
+class RemotePinningNotifier extends Notifier<bool> {
+  @override
+  bool build() => false; 
+
+  void toggleStatus(bool value) {
+    state = value;
+  }
+}
+
+final remotePinningProvider = NotifierProvider<RemotePinningNotifier, bool>(() {
+  return RemotePinningNotifier();
+});
 
 class MapScreen extends ConsumerStatefulWidget {
   const MapScreen({super.key});
@@ -34,10 +52,32 @@ class _MapScreenState extends ConsumerState<MapScreen> {
   CustomerModel? _selectedAndVerifiedCustomer;
   String? _resolvedFullAddress;
 
+  bool _isAdmin = false;
+  String _userName = "Yükleniyor...";
+  String _userRole = "";
+
   @override
   void initState() {
     super.initState();
     _initLocationService();
+    _checkAdminStatus(); 
+    
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(customerProvider.notifier).fetchMyCustomers();
+    });
+  }
+
+  Future<void> _checkAdminStatus() async {
+    const storage = FlutterSecureStorage();
+    String? role = await storage.read(key: 'saldept_code');
+    String? savedUsername = await storage.read(key: 'username');
+    if (mounted) {
+      setState(() {
+        _isAdmin = (role == 'ADMIN' || role == '*');
+        _userName = savedUsername ?? "Aktif Personel";
+        _userRole = role ?? "Saha Ekibi";
+      });
+    }
   }
 
   @override
@@ -65,41 +105,45 @@ class _MapScreenState extends ConsumerState<MapScreen> {
     }
 
     _locationSubscription = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 0)
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 10)
     ).listen((Position position) {
       if (!mounted) return; 
+
+      // SENİOR DOKUNUŞU: Sahte Konum (Fake GPS) Engellemesi
+      if (position.isMocked) {
+        _showSnackBar('🚨 DİKKAT: Sahte Konum tespit edildi! İşlemler durduruldu.', Colors.red);
+        return; 
+      }
+
       setState(() {
         _userLocation = LatLng(position.latitude, position.longitude);
-        // SENİOR DOKUNUŞU: Harita ilk kez açıldığında kullanıcının gerçek canlı konumuna zumla!
         if (!_isMapCenteredOnUser) {
-          _mapController.move(_userLocation!, 16.0); // 15.0 sokak seviyesi yakınlaştırmasıdır
-          _isMapCenteredOnUser = true; // Sadece bir kez çalışması için kilitliyoruz
+          _mapController.move(_userLocation!, 16.0); 
+          _isMapCenteredOnUser = true; 
         }
       });
     });
   }
 
-  void _performSearch() {
+  void _performSearch() async {
     FocusScope.of(context).unfocus(); 
     final id = _searchController.text.trim();
     
     if (id.isNotEmpty && !id.contains("Lat:")) {
-      ref.read(customerProvider.notifier).searchCustomers(id);
+      final foundCustomer = await ref.read(customerProvider.notifier).searchCustomers(id);
       
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (!mounted) return; 
-        final state = ref.read(customerProvider);
-        if (state.customers.isNotEmpty) {
-          _mapController.move(
-            LatLng(state.customers.first.latitude, state.customers.first.longitude),
-            14.0 
-          );
+      if (foundCustomer != null && mounted) {
+        if (foundCustomer.latitude == 0.0 && foundCustomer.longitude == 0.0) {
+          if (_userLocation != null) _mapController.move(_userLocation!, 16.0);
+        } else {
+          _mapController.move(LatLng(foundCustomer.latitude, foundCustomer.longitude), 16.0);
         }
-      });
+      }
     }
   }
 
   Future<void> _verifyAndPinLocation(CustomerModel customer) async {
+    FocusScope.of(context).unfocus();
     if (_userLocation == null) {
       _showSnackBar('Canlı konumunuz aranıyor, lütfen bekleyin...', Colors.orange);
       return;
@@ -109,6 +153,8 @@ class _MapScreenState extends ConsumerState<MapScreen> {
       _userLocation!.latitude, _userLocation!.longitude,
       customer.latitude, customer.longitude,
     );
+
+    bool isRemoteAllowed = ref.read(remotePinningProvider);
 
     if (distanceInMeters <= _allowedRadius) {
       _showSnackBar('Mesafe onaylandı! Adres çözümleniyor...', Colors.blueAccent);
@@ -129,27 +175,35 @@ class _MapScreenState extends ConsumerState<MapScreen> {
       });
 
     } else {
-      showDialog(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text("Mesafe Uyarısı"),
-          content: Text("Sistemdeki konuma ${distanceInMeters.toStringAsFixed(0)} metre uzaktasınız.\n\nEğer şu an doğru müşteri konumundaysanız (Sistemde yanlış işaretlenmişse), mevcut konumunuzu bu müşteri için yeni merkez olarak belirleyebilirsiniz."),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text("İptal", style: TextStyle(color: Colors.grey)),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.blue.shade900),
-              onPressed: () {
-                Navigator.pop(context); 
-                _forcePinCurrentLocation(customer.customerId); 
-              },
-              child: const Text("Burayı Yeni Konum Yap", style: TextStyle(color: Colors.white)),
-            ),
-          ],
-        ),
-      );
+      if (isRemoteAllowed) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text("Mesafe Uyarısı (Yönetici Modu)"),
+            content: Text("Sistemdeki konuma ${distanceInMeters.toStringAsFixed(0)} metre uzaktasınız.\n\nYönetici yetkiniz olduğu için uzaktan güncelleyebilirsiniz."),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  FocusScope.of(context).unfocus();
+                  Navigator.pop(context);
+                },
+                child: const Text("İptal", style: TextStyle(color: Colors.grey)),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade900),
+                onPressed: () {
+                  FocusScope.of(context).unfocus();
+                  Navigator.pop(context); 
+                  _forcePinCurrentLocation(customer); 
+                },
+                child: const Text("Uzaktan Güncelle", style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          ),
+        );
+      } else {
+        _showSnackBar('Konuma ${distanceInMeters.toStringAsFixed(0)} metre uzaktasınız. Yaklaşmadan güncelleyemezsiniz!', Colors.red);
+      }
     }
   }
 
@@ -158,22 +212,16 @@ class _MapScreenState extends ConsumerState<MapScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), backgroundColor: color));
   }
 
-  Future<void> _forcePinCurrentLocation(String customerId) async {
+  Future<void> _forcePinCurrentLocation(CustomerModel customer) async {
     if (_userLocation == null) {
       _showSnackBar('Canlı konumunuz aranıyor, lütfen bekleyin...', Colors.orange);
       return;
     }
 
-    _showSnackBar('Özel Durum: Konum zorla eşitleniyor...', Colors.orange);
-
-    CustomerModel overrideCustomer = CustomerModel(
-      customerId: customerId,
-      latitude: _userLocation!.latitude,
-      longitude: _userLocation!.longitude,
-    );
+    _showSnackBar('Konum eşitleniyor...', Colors.orange);
 
     setState(() {
-      _verifiedPins.add(overrideCustomer.customerId + overrideCustomer.latitude.toString());
+      _verifiedPins.add(customer.customerId + customer.latitude.toString());
     });
 
     String address = await _apiService.getFullAddressFromCoordinates(_userLocation!.latitude, _userLocation!.longitude);
@@ -181,54 +229,9 @@ class _MapScreenState extends ConsumerState<MapScreen> {
 
     setState(() {
       _searchController.text = "$address (Özel Konum Ataması)";
-      _selectedAndVerifiedCustomer = overrideCustomer;
+      _selectedAndVerifiedCustomer = customer; 
       _resolvedFullAddress = address;
     });
-  }
-
-  // --- MENÜ İÇERİKLERİ ---
-  void _showUnlocatedCustomers() {
-    final customerState = ref.read(customerProvider);
-    final unlocatedCustomers = customerState.customers.where((c) => c.latitude == 0.0 && c.longitude == 0.0).toList();
-
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (context) {
-        return Container(
-          padding: const EdgeInsets.all(16),
-          height: MediaQuery.of(context).size.height * 0.5,
-          child: Column(
-            children: [
-              const Text("Konumu Olmayan Müşteriler", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              const Divider(),
-              if (unlocatedCustomers.isEmpty)
-                const Expanded(child: Center(child: Text("Eksik konumlu müşteri bulunmamaktadır.")))
-              else
-                Expanded(
-                  child: ListView.builder(
-                    itemCount: unlocatedCustomers.length,
-                    itemBuilder: (context, index) {
-                      final customer = unlocatedCustomers[index];
-                      return Card(
-                        child: ListTile(
-                          leading: const Icon(Icons.location_off, color: Colors.redAccent),
-                          title: Text(customer.customerId),
-                          subtitle: const Text("Konum atanmamış, buraya sabitlemek için dokunun."),
-                          onTap: () {
-                            Navigator.pop(context); 
-                            _forcePinCurrentLocation(customer.customerId); 
-                          },
-                        ),
-                      );
-                    },
-                  ),
-                ),
-            ],
-          ),
-        );
-      },
-    );
   }
 
   void _showPendingSyncs() {
@@ -251,7 +254,10 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                 ),
               ),
               ElevatedButton(
-                onPressed: () => Navigator.pop(context),
+                onPressed: () {
+                  FocusScope.of(context).unfocus();
+                  Navigator.pop(context);
+                },
                 child: const Text("Kapat"),
               )
             ],
@@ -276,7 +282,7 @@ class _MapScreenState extends ConsumerState<MapScreen> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Uygulama Sürümü: v1.0.0", style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text("Uygulama Sürümü: v1.0.1", style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 10),
             const Text("Bağlantı Durumu: Çevrimiçi", style: TextStyle(color: Colors.green)),
             const Divider(),
@@ -285,15 +291,36 @@ class _MapScreenState extends ConsumerState<MapScreen> {
               leading: const Icon(Icons.delete_sweep, color: Colors.redAccent),
               title: const Text("Yerel Önbelleği Temizle"),
               onTap: () {
+                FocusScope.of(context).unfocus();
                 Navigator.pop(context);
                 _showSnackBar("Önbellek temizlendi.", Colors.green);
               },
             ),
+            if (_isAdmin)
+              Consumer(
+                builder: (context, ref, child) {
+                  final isRemoteEnabled = ref.watch(remotePinningProvider);
+                  return SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    activeThumbColor: Colors.redAccent, 
+                    activeTrackColor: Colors.redAccent.withValues(alpha: 0.5),
+                    title: const Text("Uzaktan Güncelleme", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                    subtitle: const Text("Yönetici Yetkisi", style: TextStyle(fontSize: 11)),
+                    value: isRemoteEnabled,
+                    onChanged: (val) {
+                      ref.read(remotePinningProvider.notifier).toggleStatus(val);
+                    },
+                  );
+                },
+              )
           ],
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () {
+              FocusScope.of(context).unfocus();
+              Navigator.pop(context);
+            },
             child: const Text("Kapat"),
           )
         ],
@@ -303,11 +330,27 @@ class _MapScreenState extends ConsumerState<MapScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final customerState = ref.watch(customerProvider);
+    // ----------------------------------------------------------------------
+    // 🚀 SENİOR DOKUNUŞU: RIVERPOD .select() OPTİMİZASYONU
+    // Eskiden tüm sayfayı dinliyorduk (ref.watch(customerProvider)).
+    // Artık sayfayı 3 parçaya böldük. Harita sadece liste değişirse çizilecek!
+    // ----------------------------------------------------------------------
+    final customerList = ref.watch(customerProvider.select((state) => state.customers));
+    final isLoading = ref.watch(customerProvider.select((state) => state.isLoading));
+    final errorMessage = ref.watch(customerProvider.select((state) => state.errorMessage));
+
+    bool isUnlocated = _selectedAndVerifiedCustomer != null && 
+                       _selectedAndVerifiedCustomer!.latitude == 0.0 && 
+                       _selectedAndVerifiedCustomer!.longitude == 0.0;
 
     return Scaffold(
       extendBodyBehindAppBar: true, 
       resizeToAvoidBottomInset: false, 
+      onDrawerChanged: (isOpened) {
+        if (isOpened) {
+          FocusScope.of(context).unfocus();
+        }
+      },
       appBar: AppBar(
         title: const Text('Müşteri Konum Denetimi', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black87, fontSize: 18)),
         centerTitle: true,
@@ -318,10 +361,10 @@ class _MapScreenState extends ConsumerState<MapScreen> {
         child: ListView(
           padding: EdgeInsets.zero,
           children: [
-            UserAccountsDrawerHeader(
+           UserAccountsDrawerHeader(
               decoration: BoxDecoration(color: Colors.blue.shade900),
-              accountName: const Text("Saha Personeli", style: TextStyle(fontWeight: FontWeight.bold)),
-              accountEmail: const Text("omer.ozdemir@basbuggroup.com"),
+              accountName: Text("Kullanıcı: ${_userName.toUpperCase()}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              accountEmail: Text("Yetki Kodu: $_userRole"),
               currentAccountPicture: const CircleAvatar(
                 backgroundColor: Colors.white,
                 child: Icon(Icons.person, size: 40, color: Colors.blueAccent),
@@ -330,23 +373,69 @@ class _MapScreenState extends ConsumerState<MapScreen> {
             ListTile(
               leading: const Icon(Icons.map),
               title: const Text('Harita'),
-              onTap: () => Navigator.pop(context),
+              onTap: () {
+                FocusScope.of(context).unfocus();
+                Navigator.pop(context);
+              },
             ),
             ListTile(
               leading: const Icon(Icons.sync_problem, color: Colors.orange),
               title: const Text('Bekleyen Senkronizasyonlar'),
               trailing: const CircleAvatar(radius: 12, backgroundColor: Colors.orange, child: Text('0', style: TextStyle(fontSize: 12, color: Colors.white))),
               onTap: () {
+                FocusScope.of(context).unfocus();
                 Navigator.pop(context);
                 _showPendingSyncs();
               },
             ),
+            const Divider(),
             ListTile(
-              leading: const Icon(Icons.location_off),
-              title: const Text('Konumu Olmayan Müşteriler'),
-              onTap: () {
+              leading: const Icon(Icons.location_off, color: Colors.redAccent),
+              title: const Text('Konumu Olmayan Müşteriler', style: TextStyle(fontWeight: FontWeight.w600)),
+              onTap: () async {
+                FocusScope.of(context).unfocus();
+                Navigator.pop(context); 
+                _searchController.clear();
+                ref.read(customerProvider.notifier).clearSearch();
+
+                final selectedCustomerId = await Navigator.push(
+                  context, 
+                  MaterialPageRoute(builder: (context) => const UnlocatedCustomersScreen())
+                );
+                
+                if (selectedCustomerId != null && selectedCustomerId is String) {
+                  _searchController.text = selectedCustomerId;
+                  
+                  final found = await ref.read(customerProvider.notifier).searchCustomers(selectedCustomerId);
+                  if (found != null) {
+                    if (found.latitude == 0.0 && _userLocation != null) {
+                      _mapController.move(_userLocation!, 16.0);
+                    }
+                    await Future.delayed(const Duration(milliseconds: 600));
+                    _forcePinCurrentLocation(found);
+                  }
+                }
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.verified, color: Colors.green),
+              title: const Text('Kayıtlı Müşteriler', style: TextStyle(fontWeight: FontWeight.w600)),
+              onTap: () async {
+                FocusScope.of(context).unfocus();
                 Navigator.pop(context);
-                _showUnlocatedCustomers();
+                
+                _searchController.clear();
+                ref.read(customerProvider.notifier).clearSearch();
+
+                final selectedCustomerId = await Navigator.push(
+                  context, 
+                  MaterialPageRoute(builder: (context) => const LocatedCustomersScreen())
+                );
+                
+                if (selectedCustomerId != null && selectedCustomerId is String) {
+                  _searchController.text = selectedCustomerId;
+                  _performSearch(); 
+                }
               },
             ),
             const Divider(),
@@ -354,6 +443,7 @@ class _MapScreenState extends ConsumerState<MapScreen> {
               leading: const Icon(Icons.settings),
               title: const Text('Ayarlar'),
               onTap: () {
+                FocusScope.of(context).unfocus();
                 Navigator.pop(context);
                 _showSettingsDialog();
               },
@@ -362,6 +452,7 @@ class _MapScreenState extends ConsumerState<MapScreen> {
               leading: const Icon(Icons.logout, color: Colors.red),
               title: const Text('Güvenli Çıkış', style: TextStyle(color: Colors.red)),
               onTap: () async {
+                FocusScope.of(context).unfocus();
                 if (!context.mounted) return;
                 Navigator.pushAndRemoveUntil(
                   context,
@@ -385,10 +476,13 @@ class _MapScreenState extends ConsumerState<MapScreen> {
               TileLayer(
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.basbug.fieldservice',
+                tileProvider: CachedTileProvider(),
+                maxZoom: 19,
+                minZoom: 3,
+                keepBuffer: 3, 
               ),
               MarkerLayer(
                 markers: [
-                  // SENİOR DOKUNUŞU: Kendi Tasarladığımız Profesyonel Canlı Konum İmleci
                   if (_userLocation != null)
                     Marker(
                       point: _userLocation!,
@@ -411,8 +505,14 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                         ),
                       ),
                     ),
-                  // Müşteri İğneleri
-                  ...customerState.customers.where((c) => c.latitude != 0.0 && c.longitude != 0.0).map((customer) {
+                ]
+              ),
+              MarkerClusterLayerWidget(
+                options: MarkerClusterLayerOptions(
+                  maxClusterRadius: 45,
+                  size: const Size(40, 40),
+                  // DİKKAT: Artık customerState.customers değil, customerList kullanıyoruz!
+                  markers: customerList.where((c) => c.latitude != 0.0 && c.longitude != 0.0).map((customer) {
                     bool isVerified = _verifiedPins.contains(customer.customerId + customer.latitude.toString());
                     return Marker(
                       point: LatLng(customer.latitude, customer.longitude),
@@ -426,8 +526,22 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                         ),
                       ),
                     );
-                  }),
-                ],
+                  }).toList(),
+                  builder: (context, markers) {
+                    return Container(
+                      decoration: BoxDecoration(
+                        color: Colors.blue.shade900,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Center(
+                        child: Text(
+                          markers.length.toString(),
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ),
             ],
           ),
@@ -461,6 +575,7 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                                           setState(() {
                                             _selectedAndVerifiedCustomer = null; 
                                           }); 
+                                          FocusScope.of(context).unfocus();
                                         },
                                       )
                                     : null,
@@ -476,7 +591,8 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                               onSubmitted: (_) => _performSearch(),
                             ),
                           ),
-                          customerState.isLoading 
+                          // DİKKAT: Artık customerState.isLoading değil, sadece isLoading!
+                          isLoading 
                               ? const Padding(
                                   padding: EdgeInsets.all(12.0),
                                   child: SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2)),
@@ -519,51 +635,84 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                       ),
                       const Divider(),
                       Text(
-                        "Kirli veri tespit edildi. Veritabanındaki eski koordinatlar, bulunduğunuz canlı ve nokta atışı konum ile değiştirilecektir.",
+                        isUnlocated 
+                          ? "Bu müşterinin henüz bir konumu yok. Şu an bulunduğunuz canlı konumu bu müşteriye atamak için 'Kaydet' butonuna basın."
+                          : "Kirli veri tespit edildi. Veritabanındaki eski koordinatlar, bulunduğunuz canlı ve nokta atışı konum ile değiştirilecektir.",
                         style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
                       ),
                       const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        height: 45,
-                        child: ElevatedButton.icon(
-                          onPressed: () async {
-                            _showSnackBar("Holding sunucularına iletiliyor...", Colors.orange);
-                            
-                            bool success = await ref.read(customerProvider.notifier).updateAndSyncLocation(
-                              _selectedAndVerifiedCustomer!.customerId,
-                              _userLocation!.latitude,
-                              _userLocation!.longitude,
-                              _resolvedFullAddress ?? "Adres bulunamadı",
-                            );
-
-                            if (!mounted) return; 
-
-                            if (success) {
-                              _showSnackBar("BAŞARILI: Veriler şirket veritabanında ve cihazda güncellendi!", Colors.green);
-                              setState(() {
-                                _selectedAndVerifiedCustomer = null; 
-                                _searchController.clear();
-                              });
-                            } else {
-                              _showSnackBar("HATA: Sunucuya ulaşılamadı. İşlem başarısız.", Colors.red);
-                            }
-                          },
-                          icon: const Icon(Icons.cloud_upload, color: Colors.white),
-                          label: const Text("Veritabanında Güncelle", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.blue.shade900,
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      Row(
+                        children: [
+                          Expanded(
+                            flex: 1,
+                            child: SizedBox(
+                              height: 45,
+                              child: ElevatedButton.icon(
+                                onPressed: () {
+                                  FocusScope.of(context).unfocus();
+                                  setState(() {
+                                    _selectedAndVerifiedCustomer = null; 
+                                    _searchController.clear();
+                                  });
+                                  ref.read(customerProvider.notifier).clearSearch();
+                                },
+                                icon: const Icon(Icons.close, color: Colors.black54),
+                                label: const Text("İptal", style: TextStyle(color: Colors.black87)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.grey.shade300,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                ),
+                              ),
+                            ),
                           ),
-                        ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            flex: 2,
+                            child: SizedBox(
+                              height: 45,
+                              child: ElevatedButton.icon(
+                                onPressed: () async {
+                                  FocusScope.of(context).unfocus();
+                                  _showSnackBar("Holding sunucularına iletiliyor...", Colors.orange);
+                                  
+                                  bool success = await ref.read(customerProvider.notifier).updateAndSyncLocation(
+                                    _selectedAndVerifiedCustomer!, 
+                                    _userLocation!.latitude,
+                                    _userLocation!.longitude,
+                                    _resolvedFullAddress ?? "Adres bulunamadı",
+                                  );
+
+                                  if (!context.mounted) return; 
+
+                                  if (success) {
+                                    _showSnackBar("BAŞARILI: Veriler güncellendi!", Colors.green);
+                                    setState(() {
+                                      _selectedAndVerifiedCustomer = null; 
+                                      _searchController.clear();
+                                    });
+                                  } else {
+                                    _showSnackBar("HATA: İşlem başarısız.", Colors.red);
+                                  }
+                                },
+                                icon: const Icon(Icons.cloud_upload, color: Colors.white),
+                                label: const Text("Kaydet", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.blue.shade900,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       )
                     ],
                   ),
                 ),
               ),
             ),
-
-          if (customerState.errorMessage != null)
+          
+          // DİKKAT: Artık customerState.errorMessage değil, errorMessage!
+          if (errorMessage != null)
             Positioned(
               bottom: 20, left: 20, right: 20,
               child: Card(
@@ -571,7 +720,7 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
                   child: Text(
-                    customerState.errorMessage!,
+                    errorMessage,
                     style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
                     textAlign: TextAlign.center,
                   ),
@@ -591,7 +740,7 @@ class _MapScreenState extends ConsumerState<MapScreen> {
               title: const Text("Yeni Şube/Müşteri"),
               content: TextField(
                 controller: newCodeController,
-                textCapitalization: TextCapitalization.characters, // Klavyeyi otomatik büyük harf yapar
+                textCapitalization: TextCapitalization.characters,
                 decoration: const InputDecoration(
                   labelText: "Müşteri Kodu / Adı",
                   hintText: "Örn: YENI.01",
@@ -602,26 +751,14 @@ class _MapScreenState extends ConsumerState<MapScreen> {
                   onPressed: () async {
                     if (newCodeController.text.isNotEmpty) {
                       String newCode = newCodeController.text.trim().toUpperCase();
-                      Navigator.pop(context);
                       FocusScope.of(context).unfocus();
-                      _performSearch(seachText);
+                      Navigator.pop(context);
                       
-                      // 1. Haritada Pinle ve Adresi Çöz
-                      await _forcePinCurrentLocation(newCode);
-                      
-                      // 2. Personeli uğraştırmadan OTOMATİK olarak veritabanına kaydet
-                      _showSnackBar("Yeni müşteri sisteme işleniyor...", Colors.orange);
-                      await ref.read(customerProvider.notifier).updateAndSyncLocation(
-                        newCode,
-                        _userLocation!.latitude,
-                        _userLocation!.longitude,
-                        _resolvedFullAddress ?? "Adres bulunamadı",
-                      );
-                      
-                      _showSnackBar("$newCode başarıyla eklendi!", Colors.green);
+                      CustomerModel dummyNewCustomer = CustomerModel(customerId: newCode, latitude: 0.0, longitude: 0.0);
+                      await _forcePinCurrentLocation(dummyNewCustomer);
                     }
                   },
-                  child: const Text("Hemen Ekle ve Kaydet"),
+                  child: const Text("Konumlandır"),
                 )
               ],
             ),

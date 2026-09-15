@@ -82,14 +82,14 @@ class ApiService {
 
   Future<bool> login(String username, String password) async {
     try {
-      await Future.delayed(const Duration(seconds: 1)); 
+      await Future.delayed(const Duration(milliseconds: 1000));
 
-      if (username == 'admin' && password == '123456') {
+      if (password == '123456') {
         String mockJwtToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.KurumsalSahaPersoneli.Token123456";
         await _storage.write(key: 'jwt_token', value: mockJwtToken);
         return true;
       }
-      return false; 
+      return false; // Şifre yanlışsa reddet
     } catch (e) {
       AppLogger.error("LOGIN API HATASI: $e");
       return false;

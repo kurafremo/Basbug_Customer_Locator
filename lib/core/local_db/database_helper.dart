@@ -83,17 +83,31 @@ class DatabaseHelper {
     );
   }
 
-  // ARAMA (Büyük/Küçük Harf Duyarsız)
+  // --- ARAMA İŞLEMİ (Zırhlı Çeviri ve Hata Koruması) ---
   Future<List<CustomerModel>> getCustomersById(String id) async {
     final db = await instance.database;
     try {
       final maps = await db.query(
         'CustomerLocations', 
         where: 'UPPER(CustomerCode) = ?',
-        whereArgs: [id.toUpperCase()],
+        whereArgs: [id.toUpperCase().trim()],
       );
+      
       if (maps.isNotEmpty) {
-        return maps.map((e) => CustomerModel.fromMap(e)).toList();
+        return maps.map((e) {
+          // SENİOR DOKUNUŞU: Veritabanından String veya Null gelse bile çökmesini engelliyoruz!
+          double lat = 0.0;
+          double lng = 0.0;
+          
+          if (e['Latitude'] != null) lat = double.tryParse(e['Latitude'].toString()) ?? 0.0;
+          if (e['Longitude'] != null) lng = double.tryParse(e['Longitude'].toString()) ?? 0.0;
+          
+          return CustomerModel(
+            customerId: e['CustomerCode']?.toString() ?? '',
+            latitude: lat,
+            longitude: lng,
+          );
+        }).toList();
       }
       return [];
     } catch (e) {
@@ -102,10 +116,22 @@ class DatabaseHelper {
     }
   }
 
-  // --- 3. MANUEL UPSERT (ÖNCE GÜNCELLE, YOKSA EKLE) ---
-  Future<int> updateCustomerLocationLocally(String customerCode, double newLat, double newLng) async {
+  // --- 3. MANUEL UPSERT (NULL ve Çoklu Şube Koruması) ---
+  Future<int> updateCustomerLocationLocally(String customerCode, double oldLat, double oldLng, double newLat, double newLng) async {
     final db = await instance.database;
     try {
+      String whereClause;
+      List<dynamic> whereArgs;
+
+      // SENİOR DOKUNUŞU: Veritabanında "0" veya "NULL" olma durumunu güvenle yakalıyoruz
+      if (oldLat == 0.0 && oldLng == 0.0) {
+        whereClause = 'UPPER(CustomerCode) = ? AND (Latitude IS NULL OR Latitude = 0 OR Latitude = 0.0)';
+        whereArgs = [customerCode.toUpperCase().trim()];
+      } else {
+        whereClause = 'UPPER(CustomerCode) = ? AND Latitude = ? AND Longitude = ?';
+        whereArgs = [customerCode.toUpperCase().trim(), oldLat, oldLng];
+      }
+
       int changes = await db.update(
         'CustomerLocations',
         {
@@ -113,19 +139,19 @@ class DatabaseHelper {
           'Longitude': newLng,
           'GeocodeStatus': 1, // Güncellendiğini belirtmek için
         },
-        where: 'UPPER(CustomerCode) = ?',
-        whereArgs: [customerCode.toUpperCase()],
+        where: whereClause,
+        whereArgs: whereArgs,
       );
 
       if (changes == 0) {
         return await db.insert(
           'CustomerLocations',
           {
-            'CustomerCode': customerCode.toUpperCase(),
-            'Title': 'Yeni Şube / Müşteri', // DÜZELTME: CustomerName yerine Title!
+            'CustomerCode': customerCode.toUpperCase().trim(),
+            'Title': 'Yeni Şube / Müşteri', 
             'Latitude': newLat,
             'Longitude': newLng,
-            'ResolutionLevel': 2, // DÜZELTME: Tam Sayı (Integer)!
+            'ResolutionLevel': 2, 
             'GeocodeStatus': 1,
             'CreatedDate': DateTime.now().toIso8601String()
           },
@@ -133,7 +159,7 @@ class DatabaseHelper {
       }
       return changes; 
     } catch (e) {
-      AppLogger.error("🔥 YEREL DB ÇÖKME SEBEBİ: $e");
+      AppLogger.error("YENİ LOKASYON GÜNCELLEME HATASI: $e");
       return 0;
     }
   }
@@ -157,5 +183,52 @@ class DatabaseHelper {
   Future<int> removeFromSyncQueue(int id) async {
     final db = await instance.database;
     return await db.delete('SyncQueue', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // --- EKLENEN YENİ METOD: PLASİYERE GÖRE MÜŞTERİ LİSTESİ ---
+  // YÖNETİCİ SUNUMU İÇİN (Geçici): Excel'den aktarılan PlasiyerMusterileri tablosunu okur
+  // ve CustomerLocations tablosundaki koordinatlarla birleştirip (JOIN) döndürür.
+ // --- SENİOR DOKUNUŞU: YÜKSEK PERFORMANSLI VE GÜVENLİ SORGULAMA ---
+  Future<List<CustomerModel>> getCustomersBySalDept(String salDeptCode) async {
+    final db = await instance.database;
+    try {
+      // 1. TRIM ve UPPER ile kirli verileri temizleyip eşleştiriyoruz.
+      // 2. LEFT JOIN sayesinde plasiyerin müşterisi CustomerLocations'da hiç olmasa bile listeye gelir (Konumu Yok olarak).
+      final maps = await db.rawQuery('''
+        SELECT 
+          p.CUSTOMER as CustomerCode,
+          c.Latitude,
+          c.Longitude
+        FROM PlasiyerMusterileri p
+        LEFT JOIN CustomerLocations c ON TRIM(UPPER(p.CUSTOMER)) = TRIM(UPPER(c.CustomerCode))
+        WHERE TRIM(p.SALDEPT) = ?
+      ''', [salDeptCode.trim()]);
+
+      AppLogger.info("$salDeptCode kodlu plasiyer için ${maps.length} müşteri bulundu.");
+
+      if (maps.isNotEmpty) {
+        return maps.map((e) {
+          double lat = 0.0;
+          double lng = 0.0;
+          
+          if (e['Latitude'] != null) {
+            lat = double.tryParse(e['Latitude'].toString()) ?? 0.0;
+          }
+          if (e['Longitude'] != null) {
+            lng = double.tryParse(e['Longitude'].toString()) ?? 0.0;
+          }
+
+          return CustomerModel(
+            customerId: e['CustomerCode'].toString().trim(),
+            latitude: lat,
+            longitude: lng,
+          );
+        }).toList();
+      }
+      return [];
+    } catch (e) {
+      AppLogger.error("Plasiyer müşterileri çekilirken DB HATASI: $e");
+      return [];
+    }
   }
 }

@@ -54,14 +54,13 @@ class AuthNotifier extends Notifier<AuthState> {
     bool success = await _apiService.login(username, password);
 
     if (success) {
+      // SENİOR DOKUNUŞU: Giriş yapan plasiyerin kodunu (username) kasaya kaydet!
+      await _storage.write(key: 'saldept_code', value: username);
+      
       state = state.copyWith(isLoading: false, isAuthenticated: true);
       return true;
     } else {
-      state = state.copyWith(
-        isLoading: false, 
-        isAuthenticated: false,
-        errorMessage: "Kullanıcı adı veya şifre hatalı!"
-      );
+      state = state.copyWith(isLoading: false, isAuthenticated: false, errorMessage: "Kullanıcı adı veya şifre hatalı!");
       return false;
     }
   }
