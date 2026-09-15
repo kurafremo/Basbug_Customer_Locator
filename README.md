@@ -36,3 +36,16 @@ Uygulamanın AAB/APK derleme süreçleri, tersine mühendisliği (Reverse Engine
 **Geliştirme Ortamı:** Flutter & Dart, Android Studio, VS Code, Git
 **Backend Entegrasyonu:** ASP.NET Core REST API
 **Veritabanı:** SQLite (Local), SQL Server (Remote)
+
+# Customer Location Audit App (Offline-First)
+
+This project was developed for field operations to track and audit customer locations securely, even in areas with poor or no internet connectivity.
+
+## Key Features Developed:
+* **Offline-First Architecture:** Integrated a local SQLite-based synchronization queue. Field data is cached locally when offline and safely pushed to the server without "double-save" conflicts upon reconnection.
+* **Fake GPS Prevention:** Implemented security layers to detect mock locations and radius-based authorization to ensure field data integrity.
+* **High Performance UI:** Utilized Riverpod for micro-level state management, ensuring a smooth 60 FPS map rendering experience on low-end mobile devices.
+* **In-App Updates:** Integrated Google Play In-App Updates for seamless background versioning.
+
+## Technologies Used:
+Flutter, Dart, SQLite, Riverpod, Geolocator, RESTful APIs, OpenStreetMap.
